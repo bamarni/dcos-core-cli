@@ -122,6 +122,8 @@ func mesosHTTPClient(ctx api.Context, agentID string) (*httpcli.Client, error) {
 
 				return httpcli.New(
 					httpcli.Endpoint(url),
+
+					// Use JSON over protobuf to ease logging.
 					httpcli.Codec(codecs.ByMediaType[codecs.MediaTypeJSON]),
 				), nil
 			}
@@ -134,6 +136,8 @@ func mesosHTTPClient(ctx api.Context, agentID string) (*httpcli.Client, error) {
 	httpClient := httpcli.New(
 		httpcli.Endpoint(fmt.Sprintf("%s/slave/%s/api/v1", cluster.URL(), agentID)),
 		httpcli.Do(httpcli.With(httpcli.RoundTripper(rt))),
+
+		// Use JSON over protobuf to ease logging.
 		httpcli.Codec(codecs.ByMediaType[codecs.MediaTypeJSON]),
 	)
 	return httpClient, nil
