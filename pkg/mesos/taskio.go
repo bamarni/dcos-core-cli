@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	mesos "github.com/mesos/mesos-go/api/v1/lib"
 	"github.com/mesos/mesos-go/api/v1/lib/agent"
 	agentcalls "github.com/mesos/mesos-go/api/v1/lib/agent/calls"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh/terminal"
 )
 
@@ -27,9 +29,11 @@ type TaskIOOpts struct {
 	Stderr            io.Writer
 	Interactive       bool
 	TTY               bool
+	User              string
 	HeartbeatInterval time.Duration
 	EscapeSequence    []byte
 	Sender            agentcalls.Sender
+	Logger            *logrus.Logger
 }
 
 // TaskIO is an abstraction used to stream I/O between a running Mesos task and the local terminal.
@@ -63,8 +67,70 @@ func NewTaskIO(containerID mesos.ContainerID, opts TaskIOOpts) (*TaskIO, error) 
 	}, nil
 }
 
-// Attach attaches the stdin/stdout/stderr of the CLI to the STDIN/STDOUT/STDERR of a running task.
-//
+// Exec execs a task.
+func (t *TaskIO) Exec(cmd string, args ...string) (int, error) {
+
+	// This cancellable context will be shared across the different HTTP calls,
+	// when any HTTP request finishes the context will be cancelled. We do not
+	// have a rety logic.
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
+	errCh := make(chan error, 2)
+	defer close(errCh)
+
+	// We use a WaitGroup and will wait for all HTTP connections to be closed before returning.
+	var wg sync.WaitGroup
+
+	nestedContainerLaunched := make(chan struct{})
+
+	// Launch nested container session.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+
+		err := t.launchNestedContainerSession(ctx, nestedContainerLaunched, cmd, args...)
+		if err != nil && ctx.Err() == nil {
+			errCh <- err
+		}
+	}()
+
+	// wait for the nested container session to be launched.
+	<-nestedContainerLaunched
+
+	fmt.Println(t.containerID)
+
+	if t.opts.Interactive {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer cancel()
+
+			err := t.attachContainerInput(ctx)
+			if err != nil && ctx.Err() == nil {
+				errCh <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return 0, err
+	default:
+		if t.exitSequenceDetected {
+			return 0, nil
+		}
+		if t.terminationSignalDetected {
+			// TODO(bamarni): maybe exit with the signal value + 128
+			return 1, nil
+		} //
+		return t.waitContainer()
+	}
+}
+
 // As of now, we can only attach to tasks launched with a remote TTY already set up for them.
 // If we try to attach to a task that was launched without a remote TTY attached, an error is returned.
 func (t *TaskIO) Attach() (int, error) {
@@ -109,6 +175,8 @@ func (t *TaskIO) Attach() (int, error) {
 
 	wg.Wait()
 
+	time.Sleep(10 * time.Second)
+
 	select {
 	case err := <-errCh:
 		return 0, err
@@ -119,8 +187,83 @@ func (t *TaskIO) Attach() (int, error) {
 		if t.terminationSignalDetected {
 			// TODO(bamarni): maybe exit with the signal value + 128
 			return 1, nil
-		}
+		} //
 		return t.waitContainer()
+	}
+}
+
+func (t *TaskIO) launchNestedContainerSession(ctx context.Context, launched chan<- struct{}, cmd string, args ...string) error {
+	oldContainerID := t.containerID
+
+	t.containerID = mesos.ContainerID{
+		Parent: &oldContainerID,
+		Value:  "toto",
+	}
+
+	t.opts.Logger.Infof("launching nested container with ID '%s'", t.containerID.Value)
+
+	fullCmd := append([]string{cmd}, args...)
+
+	fullCmdStr := strings.Join(fullCmd, " ")
+
+	cmdInfo := &mesos.CommandInfo{
+		Value:     &fullCmdStr,
+		Arguments: fullCmd,
+	}
+
+	if t.opts.User != "" {
+		cmdInfo.User = &t.opts.User
+	}
+
+	containerInfo := &mesos.ContainerInfo{
+		Type: mesos.ContainerInfo_MESOS.Enum(),
+	}
+
+	if t.opts.TTY {
+		containerInfo.TTYInfo = &mesos.TTYInfo{}
+	}
+
+	call := agentcalls.LaunchNestedContainerSession(t.containerID, cmdInfo, containerInfo)
+
+	// Send returns immediately with a Response from which output may be decoded.
+	resp, err := t.opts.Sender.Send(ctx, agentcalls.NonStreaming(call))
+	if resp != nil {
+		defer resp.Close()
+	}
+	if err != nil {
+		return err
+	}
+
+	close(launched)
+
+	forward := func(b []byte, out io.Writer) error {
+		n, err := out.Write(b)
+		if err == nil && len(b) != n {
+			err = io.ErrShortWrite
+		}
+		return err
+	}
+	for {
+		var pio agent.ProcessIO
+		err := resp.Decode(&pio)
+		if err != nil {
+			return err
+		}
+
+		switch pio.GetType() {
+		case agent.ProcessIO_DATA:
+			data := pio.GetData()
+			switch data.GetType() {
+			case agent.ProcessIO_Data_STDOUT:
+				if err := forward(data.GetData(), t.opts.Stdout); err != nil {
+					return err
+				}
+			case agent.ProcessIO_Data_STDERR:
+				if err := forward(data.GetData(), t.opts.Stderr); err != nil {
+					return err
+				}
+			}
+		}
 	}
 }
 
@@ -137,14 +280,6 @@ func (t *TaskIO) attachContainerInput(ctx context.Context) error {
 		return fmt.Errorf("stdin is not a terminal")
 	}
 
-	// Set the terminal in raw mode and make sure it's restored
-	// to its previous state before the function returns.
-	oldState, err := terminal.MakeRaw(stdinFd)
-	if err != nil {
-		return err
-	}
-	defer terminal.Restore(stdinFd, oldState)
-
 	// Create a proxy reader for stdin which is able to detect the escape sequence.
 	t.opts.Stdin = term.NewEscapeProxy(t.opts.Stdin, t.opts.EscapeSequence)
 
@@ -152,19 +287,30 @@ func (t *TaskIO) attachContainerInput(ctx context.Context) error {
 	ttyInfoCh := make(chan *mesos.TTYInfo, 2)
 	receivedTerminationSignal := make(chan struct{})
 
-	if runtime.GOOS != "windows" {
-		// To force a redraw of the remote terminal, we first resize it to 0 before setting it
-		// to the actual size of our local terminal. After that, all terminal resizing is handled
-		// in our SIGWINCH handler.
-		ttyInfoCh <- &mesos.TTYInfo{WindowSize: &mesos.TTYInfo_WindowSize{}}
-		ttyInfo, err := t.ttyInfo(stdinFd)
+	if t.opts.TTY {
+
+		// Set the terminal in raw mode and make sure it's restored
+		// to its previous state before the function returns.
+		oldState, err := terminal.MakeRaw(stdinFd)
 		if err != nil {
 			return err
 		}
-		ttyInfoCh <- ttyInfo
-	}
+		defer terminal.Restore(stdinFd, oldState)
 
-	go t.handleSignals(stdinFd, ttyInfoCh, receivedTerminationSignal)
+		if runtime.GOOS != "windows" {
+			// To force a redraw of the remote terminal, we first resize it to 0 before setting it
+			// to the actual size of our local terminal. After that, all terminal resizing is handled
+			// in our SIGWINCH handler.
+			ttyInfoCh <- &mesos.TTYInfo{WindowSize: &mesos.TTYInfo_WindowSize{}}
+			ttyInfo, err := t.ttyInfo(stdinFd)
+			if err != nil {
+				return err
+			}
+			ttyInfoCh <- ttyInfo
+		}
+
+		go t.handleSignals(stdinFd, ttyInfoCh, receivedTerminationSignal)
+	}
 
 	// Must be buffered to avoid blocking below.
 	aciCh := make(chan *agent.Call, 1)
