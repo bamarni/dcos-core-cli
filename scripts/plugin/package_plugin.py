@@ -18,7 +18,7 @@ description = "Deploy and manage jobs in DC/OS"
 
 [[commands]]
 name = "marathon"
-path = "bin/dcos_py{0}"
+path = "python/main{0}"
 description = "Deploy and manage applications to DC/OS"
 
 [[commands]]
@@ -82,14 +82,14 @@ def package_binaries(plugin_path: str, platform: str, python_bin_dir: str):
     bin_extension = ".exe" if platform == "windows" else ""
 
     go_bin = path.join(plugin_path, "..", "dcos{}".format(bin_extension))
-    python_bin = path.join(python_bin_dir, "dcos{}".format(bin_extension))
+    python_dir = path.join(python_bin_dir, "main")
+
+    dir_util.copy_tree(python_dir, path.join(plugin_path, "python"))
 
     dest = path.join(plugin_path, "bin")
     dir_util.mkpath(dest)
 
     file_util.copy_file(go_bin, path.join(dest, "dcos{}".format(bin_extension)))
-    file_util.copy_file(python_bin, path.join(
-        dest, "dcos_py{}".format(bin_extension)))
 
 
 def package_plugin(build_path: str,
